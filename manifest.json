@@ -1,0 +1,10 @@
+{
+  "id": "raindrop-sync",
+  "name": "Raindrop Sync",
+  "version": "0.1.0",
+  "minAppVersion": "0.15.0",
+  "description": "Bidirectional sync between Raindrop.io bookmarks and Obsidian notes",
+  "author": "Iroshan De Silva",
+  "authorUrl": "https://iroshandezilva.com",
+  "isDesktopOnly": false
+}
