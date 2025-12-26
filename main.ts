@@ -256,6 +256,13 @@ export default class RaindropSyncPlugin extends Plugin {
         if (file.extension !== "md") continue;
 
         try {
+          // Check if file still exists before reading
+          const fileExists = this.app.vault.getAbstractFileByPath(file.path);
+          if (!fileExists) {
+            console.warn(`File no longer exists, skipping: ${file.path}`);
+            continue;
+          }
+
           const content = await this.app.vault.read(file);
           const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
 
@@ -268,8 +275,9 @@ export default class RaindropSyncPlugin extends Plugin {
             await this.app.vault.delete(file);
             deletedCount++;
           }
-        } catch (error) {
-          console.error(`Failed to process file ${file.path}:`, error);
+        } catch (error: any) {
+          console.warn(`Skipping file ${file.path}: ${error.message || error}`);
+          continue; // Continue with next file
         }
       }
 
@@ -317,7 +325,8 @@ export default class RaindropSyncPlugin extends Plugin {
     }
   }
 
-  async cleanupDeletedCollections(
+  async cleanupDeletedBookmarks(
+    syncedRaindropIds: Set<number>,
     activeCollections: Map<number, RaindropCollection>
   ): Promise<void> {
     try {
@@ -329,18 +338,22 @@ export default class RaindropSyncPlugin extends Plugin {
         return;
       }
 
-      // Get all collection IDs that currently exist in Raindrop
-      const activeCollectionIds = new Set<number>();
-      activeCollections.forEach((_, id) => activeCollectionIds.add(id));
-
-      // Find all files and check their collection IDs
+      // Find all files and check if their bookmarks still exist in Raindrop
       const files = this.getAllFilesInFolder(folder);
-      const orphanedCollectionIds = new Set<number>();
+      let deletedCount = 0;
+      let movedToUnsortedCount = 0;
 
       for (const file of files) {
         if (file.extension !== "md") continue;
 
         try {
+          // Check if file still exists before reading
+          const fileExists = this.app.vault.getAbstractFileByPath(file.path);
+          if (!fileExists) {
+            console.warn(`File no longer exists, skipping: ${file.path}`);
+            continue;
+          }
+
           const content = await this.app.vault.read(file);
           const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
 
@@ -351,34 +364,38 @@ export default class RaindropSyncPlugin extends Plugin {
 
           if (!raindropIdMatch) continue;
 
-          // Get the collection ID from the bookmark
-          const collectionMatch = frontmatter.match(/collection:\s*(.+)/);
-          if (collectionMatch) {
-            const collectionName = collectionMatch[1].trim();
+          const raindropId = parseInt(raindropIdMatch[1]);
 
-            // Check if this collection still exists in Raindrop
-            let collectionExists = false;
-            activeCollections.forEach((col) => {
-              if (col.title === collectionName) {
-                collectionExists = true;
-              }
-            });
-
-            if (!collectionExists && collectionName !== "Unsorted") {
-              // Collection was deleted, delete the file
-              await this.app.vault.delete(file);
-              console.log(`Deleted file from removed collection: ${file.path}`);
-            }
+          // Check if this bookmark still exists in Raindrop
+          if (!syncedRaindropIds.has(raindropId)) {
+            // Bookmark was deleted from Raindrop
+            // Option 1: Delete the file (current behavior)
+            await this.app.vault.delete(file);
+            deletedCount++;
+            console.log(
+              `Deleted file for bookmark removed from Raindrop: ${file.path} (ID: ${raindropId})`
+            );
+          } else {
+            // Bookmark exists, but check if collection changed
+            // This will be handled by createOrUpdateNote which moves files to correct locations
+            // So we don't need to do anything here
           }
-        } catch (error) {
-          console.error(`Failed to process file ${file.path}:`, error);
+        } catch (error: any) {
+          console.warn(`Skipping file ${file.path}: ${error.message || error}`);
+          continue; // Continue with next file
         }
       }
 
       // Clean up any empty folders left behind
       await this.cleanupEmptyFolders(folder);
+
+      if (deletedCount > 0) {
+        console.log(
+          `🗑️ Cleaned up ${deletedCount} file(s) for bookmarks deleted from Raindrop`
+        );
+      }
     } catch (error) {
-      console.error("Failed to cleanup deleted collections:", error);
+      console.error("Failed to cleanup deleted bookmarks:", error);
     }
   }
 
@@ -386,7 +403,9 @@ export default class RaindropSyncPlugin extends Plugin {
     totalBookmarks: number,
     createdCount: number,
     updatedCount: number,
-    syncedBackCount: number
+    syncedBackCount: number,
+    skippedCount: number = 0,
+    failedCount: number = 0
   ): Promise<void> {
     try {
       const statusNotePath = normalizePath(
@@ -423,6 +442,8 @@ last_sync: ${now.toISOString()}
 - **Total Bookmarks:** ${totalBookmarks}
 - **Created:** ${createdCount}
 - **Updated:** ${updatedCount}
+- **Skipped:** ${skippedCount}
+${failedCount > 0 ? `- **Failed:** ${failedCount} ⚠️` : ""}
 ${
   this.settings.bidirectionalSync
     ? `- **Synced Back to Raindrop:** ${syncedBackCount}`
@@ -507,7 +528,10 @@ ${
       // Create notes for each bookmark (Raindrop → Obsidian)
       let createdCount = 0;
       let updatedCount = 0;
+      let skippedCount = 0;
+      let failedCount = 0;
       let processedCount = 0;
+      const failedBookmarks: Array<{ id: number; title: string; error: string }> = [];
 
       for (const bookmark of bookmarks) {
         processedCount++;
@@ -516,16 +540,39 @@ ${
           `🔄 Syncing ${processedCount}/${totalBookmarks}...`
         );
 
-        const result = await this.createOrUpdateNote(bookmark, collections);
-        if (result === "created") createdCount++;
-        if (result === "updated") updatedCount++;
+        try {
+          const result = await this.createOrUpdateNote(bookmark, collections);
+          if (result === "created") createdCount++;
+          else if (result === "updated") updatedCount++;
+          else if (result === "skipped") skippedCount++;
+        } catch (error: any) {
+          failedCount++;
+          const errorMessage = error?.message || String(error);
+          failedBookmarks.push({
+            id: bookmark._id,
+            title: bookmark.title || "Untitled",
+            error: errorMessage,
+          });
+          console.error(
+            `Failed to sync bookmark ${bookmark._id} (${bookmark.title}):`,
+            error
+          );
+          // Continue with next bookmark instead of stopping
+        }
       }
 
-      // Clean up folders for deleted collections
-      if (this.settings.useCollectionFolders) {
-        this.statusBarItem.setText("🔄 Cleaning up deleted collections...");
-        await this.cleanupDeletedCollections(collections);
+      // Log failed bookmarks if any
+      if (failedBookmarks.length > 0) {
+        console.warn(
+          `⚠️ ${failedBookmarks.length} bookmarks failed to sync:`,
+          failedBookmarks
+        );
       }
+
+      // Clean up bookmarks that were deleted from Raindrop
+      this.statusBarItem.setText("🔄 Cleaning up deleted bookmarks...");
+      const syncedRaindropIds = new Set(bookmarks.map((b) => b._id));
+      await this.cleanupDeletedBookmarks(syncedRaindropIds, collections);
 
       this.lastSyncTime = new Date();
       this.updateStatusBar();
@@ -535,14 +582,32 @@ ${
         totalBookmarks,
         createdCount,
         updatedCount,
-        syncedBackCount
+        syncedBackCount,
+        skippedCount,
+        failedCount
       );
 
-      const message = this.settings.bidirectionalSync
-        ? `✓ Sync completed! Created: ${createdCount}, Updated: ${updatedCount}, Synced back: ${syncedBackCount}`
-        : `✓ Sync completed! Created: ${createdCount}, Updated: ${updatedCount}`;
+      let message = `✓ Sync completed! Created: ${createdCount}, Updated: ${updatedCount}`;
+      if (skippedCount > 0) message += `, Skipped: ${skippedCount}`;
+      if (failedCount > 0) message += `, Failed: ${failedCount}`;
+      if (this.settings.bidirectionalSync) message += `, Synced back: ${syncedBackCount}`;
 
       new Notice(message);
+      
+      // Show warning if not all bookmarks were processed
+      if (totalBookmarks !== createdCount + updatedCount + skippedCount + failedCount) {
+        console.warn(
+          `⚠️ Bookmark count mismatch: Total=${totalBookmarks}, Processed=${createdCount + updatedCount + skippedCount + failedCount}`
+        );
+      }
+      
+      // Show warning if failed bookmarks exist
+      if (failedCount > 0) {
+        new Notice(
+          `⚠️ ${failedCount} bookmarks failed to sync. Check console for details.`,
+          8000
+        );
+      }
     } catch (error) {
       console.error("Sync failed:", error);
       new Notice("✗ Sync failed. Check console for details.");
@@ -596,40 +661,89 @@ ${
     let page = 0;
     const perPage = 50;
     let hasMore = true;
+    let totalCountFromAPI: number | null = null;
+
+    console.log("📥 Starting to fetch bookmarks from Raindrop API...");
 
     while (hasMore) {
-      const response = await requestUrl({
-        url: `https://api.raindrop.io/rest/v1/raindrops/0?perpage=${perPage}&page=${page}`,
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${this.settings.apiToken}`,
-        },
-      });
+      try {
+        const response = await requestUrl({
+          url: `https://api.raindrop.io/rest/v1/raindrops/0?perpage=${perPage}&page=${page}`,
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${this.settings.apiToken}`,
+          },
+        });
 
-      if (response.status !== 200) {
-        throw new Error(`API request failed: ${response.status}`);
+        if (response.status !== 200) {
+          throw new Error(`API request failed: ${response.status}`);
+        }
+
+        const data: RaindropApiResponse = response.json;
+
+        // Store total count from API (first page)
+        if (totalCountFromAPI === null && data.count !== undefined) {
+          totalCountFromAPI = data.count;
+          console.log(`📊 Total bookmarks in Raindrop: ${totalCountFromAPI}`);
+        }
+
+        console.log(
+          `📄 Page ${page + 1}: Fetched ${data.items.length} bookmarks (Total so far: ${allBookmarks.length + data.items.length})`
+        );
+
+        allBookmarks.push(...data.items);
+
+        // Check test mode limit
+        if (
+          this.settings.testMode &&
+          allBookmarks.length >= this.settings.testModeLimit
+        ) {
+          console.log(
+            `🧪 Test mode: Limiting to ${this.settings.testModeLimit} bookmarks`
+          );
+          return allBookmarks.slice(0, this.settings.testModeLimit);
+        }
+
+        // Check if there are more pages
+        // Continue if we got a full page, or if we haven't reached the total count yet
+        hasMore = data.items.length === perPage;
+        
+        // Also check if we've fetched all bookmarks according to API count
+        if (totalCountFromAPI !== null && allBookmarks.length >= totalCountFromAPI) {
+          hasMore = false;
+          console.log(
+            `✓ Fetched all ${allBookmarks.length} bookmarks (API reported ${totalCountFromAPI})`
+          );
+        }
+
+        page++;
+
+        // Add a small delay to respect rate limits
+        if (hasMore) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      } catch (error) {
+        console.error(`❌ Error fetching page ${page}:`, error);
+        throw error; // Re-throw to stop sync if API fails
       }
+    }
 
-      const data: RaindropApiResponse = response.json;
+    console.log(
+      `✅ Finished fetching: ${allBookmarks.length} bookmarks total${
+        totalCountFromAPI !== null
+          ? ` (API reported ${totalCountFromAPI})`
+          : ""
+      }`
+    );
 
-      allBookmarks.push(...data.items);
-
-      // Check test mode limit
-      if (
-        this.settings.testMode &&
-        allBookmarks.length >= this.settings.testModeLimit
-      ) {
-        return allBookmarks.slice(0, this.settings.testModeLimit);
-      }
-
-      // Check if there are more pages
-      hasMore = data.items.length === perPage;
-      page++;
-
-      // Add a small delay to respect rate limits
-      if (hasMore) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      }
+    // Warn if count mismatch
+    if (
+      totalCountFromAPI !== null &&
+      allBookmarks.length !== totalCountFromAPI
+    ) {
+      console.warn(
+        `⚠️ Bookmark count mismatch: Fetched ${allBookmarks.length}, but API reported ${totalCountFromAPI}`
+      );
     }
 
     return allBookmarks;
@@ -665,6 +779,13 @@ ${
         }
 
         try {
+          // Check if file still exists before reading
+          const fileExists = this.app.vault.getAbstractFileByPath(file.path);
+          if (!fileExists) {
+            console.warn(`File no longer exists, skipping: ${file.path}`);
+            continue;
+          }
+
           const content = await this.app.vault.read(file);
           const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
 
@@ -719,8 +840,9 @@ ${
 
           // Rate limiting
           await new Promise((resolve) => setTimeout(resolve, 100));
-        } catch (error) {
-          console.error(`Failed to sync note ${file.path}:`, error);
+        } catch (error: any) {
+          console.warn(`Skipping file ${file.path}: ${error.message || error}`);
+          continue; // Continue with next file instead of stopping
         }
       }
     } catch (error) {
@@ -854,8 +976,13 @@ ${
       await this.ensureFolderExists(folderPath);
     }
 
-    // Sanitize filename
-    const fileName = this.sanitizeFileName(bookmark.title);
+    // Sanitize filename and ensure uniqueness
+    const baseFileName = this.sanitizeFileName(bookmark.title);
+    const fileName = await this.ensureUniqueFileName(
+      folderPath,
+      baseFileName,
+      bookmark._id
+    );
     const filePath = normalizePath(`${folderPath}/${fileName}.md`);
 
     // Check if file exists elsewhere (moved to different collection)
@@ -878,10 +1005,28 @@ ${
 
     if (existingFile instanceof TFile) {
       // Update existing file
-      const currentContent = await this.app.vault.read(existingFile);
+      let currentContent: string;
+      try {
+        currentContent = await this.app.vault.read(existingFile);
+      } catch (error) {
+        console.warn(
+          `File exists in vault but cannot be read: ${filePath}. Creating new file.`
+        );
+        // If file can't be read, treat it as if it doesn't exist
+        await this.app.vault.create(filePath, noteContent);
+        return "created";
+      }
 
       // Check if file was modified locally (protect local edits)
       const frontmatterMatch = currentContent.match(/^---\n([\s\S]*?)\n---/);
+
+      // Check if frontmatter needs YAML escaping fix
+      // (detect unescaped colons in title, url, etc.)
+      const needsEscapingFix =
+        frontmatterMatch &&
+        !frontmatterMatch[1].includes('title: "') &&
+        /title:.*:/.test(frontmatterMatch[1]);
+
       if (frontmatterMatch) {
         const frontmatter = frontmatterMatch[1];
         const lastSyncedMatch = frontmatter.match(/last_synced:\s*(.+)/);
@@ -910,6 +1055,15 @@ ${
             return "updated";
           }
         }
+      }
+
+      // Force update if file needs escaping fix (even if content is similar)
+      if (needsEscapingFix) {
+        console.log(
+          `  🔧 Updating file with proper YAML escaping: ${filePath}`
+        );
+        await this.app.vault.modify(existingFile, noteContent);
+        return "updated";
       }
 
       // Only update if content is different
@@ -952,7 +1106,8 @@ ${
           return file;
         }
       } catch (error) {
-        console.error(`Failed to read file ${file.path}:`, error);
+        console.warn(`Skipping file ${file.path}: ${error.message}`);
+        continue; // Skip files that can't be read
       }
     }
 
@@ -971,6 +1126,79 @@ ${
       .replace(/\s+/g, " ")
       .trim()
       .substring(0, 200); // Limit length
+  }
+
+  async ensureUniqueFileName(
+    folderPath: string,
+    baseFileName: string,
+    raindropId: number
+  ): Promise<string> {
+    let fileName = baseFileName;
+    let counter = 1;
+    const maxAttempts = 1000; // Prevent infinite loops
+
+    while (counter < maxAttempts) {
+      const filePath = normalizePath(`${folderPath}/${fileName}.md`);
+      const existingFile = this.app.vault.getAbstractFileByPath(filePath);
+
+      if (!existingFile) {
+        // File doesn't exist, we can use this name
+        return fileName;
+      }
+
+      // File exists, check if it's the same bookmark
+      if (existingFile instanceof TFile) {
+        try {
+          const content = await this.app.vault.read(existingFile);
+          const frontmatterMatch = content.match(/^---\n([\s\S]*?)\n---/);
+
+          if (frontmatterMatch) {
+            const frontmatter = frontmatterMatch[1];
+            const raindropIdMatch = frontmatter.match(/raindrop_id:\s*(\d+)/);
+
+            if (raindropIdMatch && parseInt(raindropIdMatch[1]) === raindropId) {
+              // Same bookmark, we can use this name (will update existing file)
+              return fileName;
+            }
+          }
+        } catch (error) {
+          // If we can't read the file, assume it's a different bookmark
+          console.warn(
+            `Could not read existing file ${filePath}, will use different name`
+          );
+        }
+      }
+
+      // Different bookmark with same name, add counter
+      counter++;
+      fileName = `${baseFileName}-${counter}`;
+    }
+
+    // Fallback: use raindrop ID if we can't find a unique name
+    console.warn(
+      `Could not find unique filename for ${baseFileName}, using raindrop ID`
+    );
+    return `${baseFileName}-${raindropId}`;
+  }
+
+  escapeYamlValue(value: string): string {
+    // If value is empty, return empty string
+    if (!value) return '""';
+
+    // Check if value needs quoting (contains special YAML characters)
+    const needsQuoting =
+      /[:\[\]{}#&*!|>'"%@`]/.test(value) ||
+      value.startsWith(" ") ||
+      value.endsWith(" ") ||
+      value.includes("\n");
+
+    if (!needsQuoting) {
+      return value;
+    }
+
+    // Escape double quotes and backslashes, then wrap in quotes
+    const escaped = value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    return `"${escaped}"`;
   }
 
   generateNoteContent(
@@ -995,20 +1223,39 @@ ${
     };
 
     const obsidianTags = sanitizeTags(bookmark.tags || []);
+
+    // Add default tag for all Raindrop bookmarks
+    if (!obsidianTags.includes("raindrop-bookmarks")) {
+      obsidianTags.unshift("raindrop-bookmarks"); // Add at beginning
+    }
+
     const inlineTags = obsidianTags.map((tag) => `#${tag}`);
     const tagsLine = inlineTags.length > 0 ? inlineTags.join(" ") : "";
 
+    // Format tags properly for Obsidian properties
+    let tagsYaml: string;
+    if (obsidianTags.length === 0) {
+      tagsYaml = "tags: []"; // Use inline format for empty arrays
+    } else {
+      tagsYaml = `tags:\n${obsidianTags.map((tag) => `  - ${tag}`).join("\n")}`;
+    }
+
+    // Escape YAML values that might contain special characters
+    const escapedTitle = this.escapeYamlValue(title);
+    const escapedUrl = this.escapeYamlValue(bookmark.link || "");
+    const escapedCollection = this.escapeYamlValue(collectionTitle);
+    const escapedDomain = this.escapeYamlValue(bookmark.domain || "Unknown");
+
     const content = `---
-title: ${title}
-url: ${bookmark.link || ""}
+title: ${escapedTitle}
+url: ${escapedUrl}
 raindrop_id: ${bookmark._id}
-collection: ${collectionTitle}
-tags:
-${obsidianTags.map((tag) => `  - ${tag}`).join("\n") || "  []"}
+collection: ${escapedCollection}
+${tagsYaml}
 created: ${bookmark.created}
 last_synced: ${new Date().toISOString()}
 type: raindrop-bookmark
-domain: ${bookmark.domain || "Unknown"}
+domain: ${escapedDomain}
 added: ${new Date(bookmark.created).toLocaleDateString()}
 ---
 
